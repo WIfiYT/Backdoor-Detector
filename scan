@@ -1,54 +1,174 @@
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$FilePath
-)
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 
-if (!(Test-Path $FilePath)) {
-    Write-Host "File not found: $FilePath" -ForegroundColor Red
-    exit
-}
+# --- GLOBAL SETTINGS ---
+$QuarantinePath = "$env:USERPROFILE\Desktop\Quarantine"
+New-Item -ItemType Directory -Force -Path $QuarantinePath | Out-Null
 
-$content = Get-Content $FilePath -Raw
-
-# Suspicious patterns often used in malicious scripts
-$patterns = @{
-    "EncodedCommand" = "EncodedCommand"
-    "Base64" = "[A-Za-z0-9+/]{100,}={0,2}"
-    "DownloadString" = "DownloadString"
-    "Invoke-WebRequest" = "Invoke-WebRequest"
-    "IEX" = "\bIEX\b|Invoke-Expression"
-    "HiddenWindow" = "-WindowStyle\s+Hidden"
-    "BypassPolicy" = "ExecutionPolicy\s+Bypass"
-    "Add-MpPreference" = "Add-MpPreference"
-    "NetClient" = "System\.Net\.WebClient"
-    "Reflection" = "Reflection\.Assembly"
-    "Start-Process" = "Start-Process"
-}
-
-$results = @()
-
-foreach ($key in $patterns.Keys) {
-    if ($content -match $patterns[$key]) {
-        $results += $key
+# --- FUNCTION: Decode Base64 ---
+function Decode-Base64 {
+    param($text)
+    try {
+        $bytes = [Convert]::FromBase64String($text)
+        return [Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        return $null
     }
 }
 
-# Output results
-if ($results.Count -eq 0) {
-    Write-Host "No obvious suspicious patterns found." -ForegroundColor Green
-} else {
-    Write-Host "Potentially suspicious indicators detected:" -ForegroundColor Yellow
-    $results | ForEach-Object { Write-Host " - $_" }
+# --- FUNCTION: Analyze Content ---
+function Analyze-Content {
+    param($content)
+
+    $score = 0
+    $findings = @()
+
+    function Add-Finding($msg, $weight) {
+        $script:findings += $msg
+        $script:score += $weight
+    }
+
+    # --- AST parsing ---
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$tokens, [ref]$errors)
+
+    $ast.FindAll({
+        param($node)
+
+        if ($node -is [System.Management.Automation.Language.CommandAst]) {
+            $cmd = $node.GetCommandName()
+
+            if ($cmd -match "Invoke-Expression|IEX") {
+                Add-Finding "Code execution (IEX)" 3
+            }
+            if ($cmd -match "Invoke-WebRequest|curl|wget") {
+                Add-Finding "Downloads remote content" 2
+            }
+            if ($cmd -match "Register-ScheduledTask") {
+                Add-Finding "Creates scheduled task (persistence)" 4
+            }
+            if ($cmd -match "New-ItemProperty") {
+                Add-Finding "Modifies registry (possible persistence)" 3
+            }
+        }
+
+        if ($node -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            if ($node.Value -match "^[A-Za-z0-9+/]{80,}={0,2}$") {
+                Add-Finding "Encoded payload detected" 3
+
+                $decoded = Decode-Base64 $node.Value
+                if ($decoded) {
+                    Add-Finding "Decoded Base64 content found" 2
+
+                    # Recursive scan
+                    $inner = Analyze-Content $decoded
+                    $script:score += $inner.Score
+                    $script:findings += $inner.Findings
+                }
+            }
+        }
+
+        return $false
+    }, $true) | Out-Null
+
+    # --- Persistence detection ---
+    if ($content -match "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
+        Add-Finding "Startup registry persistence" 4
+    }
+
+    if ($content -match "Startup") {
+        Add-Finding "Startup folder usage" 2
+    }
+
+    if ($content -match "schtasks") {
+        Add-Finding "Scheduled task via schtasks" 4
+    }
+
+    # --- Defender tampering ---
+    if ($content -match "Add-MpPreference") {
+        Add-Finding "Tampering with Windows Defender" 5
+    }
+
+    return @{
+        Score = $score
+        Findings = $findings | Sort-Object -Unique
+    }
 }
 
-# Optional: show matching lines for context
-Write-Host "`n--- Matching Lines ---" -ForegroundColor Cyan
-$lines = Get-Content $FilePath
-for ($i = 0; $i -lt $lines.Length; $i++) {
-    foreach ($pattern in $patterns.Values) {
-        if ($lines[$i] -match $pattern) {
-            Write-Host ("Line {0}: {1}" -f ($i + 1), $lines[$i])
-            break
+# --- FUNCTION: Scan File ---
+function Scan-File {
+    param($path)
+
+    $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
+    if (!$content) { return $null }
+
+    $result = Analyze-Content $content
+
+    return @{
+        Path = $path
+        Score = $result.Score
+        Findings = $result.Findings
+    }
+}
+
+# --- FUNCTION: Quarantine ---
+function Quarantine-File {
+    param($file)
+
+    $dest = Join-Path $QuarantinePath ([IO.Path]::GetFileName($file))
+    Move-Item $file $dest -Force
+}
+
+# --- FUNCTION: Notification ---
+function Show-Alert($msg) {
+    $notify = New-Object System.Windows.Forms.NotifyIcon
+    $notify.Icon = [System.Drawing.SystemIcons]::Warning
+    $notify.BalloonTipTitle = "Backdoor Analyzer Alert"
+    $notify.BalloonTipText = $msg
+    $notify.Visible = $true
+    $notify.ShowBalloonTip(5000)
+    Start-Sleep 5
+    $notify.Dispose()
+}
+
+# --- GUI ---
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "PowerShell Backdoor Analyzer"
+$form.Size = New-Object System.Drawing.Size(800,500)
+
+$buttonScan = New-Object System.Windows.Forms.Button
+$buttonScan.Text = "Scan Directory"
+$buttonScan.Size = New-Object System.Drawing.Size(150,40)
+$buttonScan.Location = New-Object System.Drawing.Point(10,10)
+
+$listBox = New-Object System.Windows.Forms.ListBox
+$listBox.Size = New-Object System.Drawing.Size(760,380)
+$listBox.Location = New-Object System.Drawing.Point(10,60)
+
+$form.Controls.Add($buttonScan)
+$form.Controls.Add($listBox)
+
+$buttonScan.Add_Click({
+    $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+    if ($folderBrowser.ShowDialog() -eq "OK") {
+
+        $files = Get-ChildItem $folderBrowser.SelectedPath -Recurse -Filter *.ps1
+
+        foreach ($file in $files) {
+            $result = Scan-File $file.FullName
+
+            if ($result -and $result.Score -gt 0) {
+                $entry = "[Score: $($result.Score)] $($file.FullName)"
+                $listBox.Items.Add($entry)
+
+                if ($result.Score -ge 6) {
+                    Show-Alert "High-risk script detected!"
+                    Quarantine-File $file.FullName
+                }
+            }
         }
     }
 }
+
+$form.ShowDialog()
