@@ -1,0 +1,54 @@
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$FilePath
+)
+
+if (!(Test-Path $FilePath)) {
+    Write-Host "File not found: $FilePath" -ForegroundColor Red
+    exit
+}
+
+$content = Get-Content $FilePath -Raw
+
+# Suspicious patterns often used in malicious scripts
+$patterns = @{
+    "EncodedCommand" = "EncodedCommand"
+    "Base64" = "[A-Za-z0-9+/]{100,}={0,2}"
+    "DownloadString" = "DownloadString"
+    "Invoke-WebRequest" = "Invoke-WebRequest"
+    "IEX" = "\bIEX\b|Invoke-Expression"
+    "HiddenWindow" = "-WindowStyle\s+Hidden"
+    "BypassPolicy" = "ExecutionPolicy\s+Bypass"
+    "Add-MpPreference" = "Add-MpPreference"
+    "NetClient" = "System\.Net\.WebClient"
+    "Reflection" = "Reflection\.Assembly"
+    "Start-Process" = "Start-Process"
+}
+
+$results = @()
+
+foreach ($key in $patterns.Keys) {
+    if ($content -match $patterns[$key]) {
+        $results += $key
+    }
+}
+
+# Output results
+if ($results.Count -eq 0) {
+    Write-Host "No obvious suspicious patterns found." -ForegroundColor Green
+} else {
+    Write-Host "Potentially suspicious indicators detected:" -ForegroundColor Yellow
+    $results | ForEach-Object { Write-Host " - $_" }
+}
+
+# Optional: show matching lines for context
+Write-Host "`n--- Matching Lines ---" -ForegroundColor Cyan
+$lines = Get-Content $FilePath
+for ($i = 0; $i -lt $lines.Length; $i++) {
+    foreach ($pattern in $patterns.Values) {
+        if ($lines[$i] -match $pattern) {
+            Write-Host ("Line {0}: {1}" -f ($i + 1), $lines[$i])
+            break
+        }
+    }
+}
